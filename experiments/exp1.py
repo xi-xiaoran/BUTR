@@ -533,7 +533,8 @@ def main():
                     # ----- train repair head if needed -----
                     repair_head = None
                     if method == "ours_v1":
-                        repair_head = RepairHeadV1(in_ch=6).to(device)
+                        # Paper-aligned repair input: [img, z, p, u, v, r] => 3 + 5 = 8 channels.
+                        repair_head = RepairHeadV1(in_ch=8).to(device)
                         repair_head = train_repair(
                             base_model=model,
                             head_mode="edl",
@@ -555,7 +556,8 @@ def main():
                         )
                         torch.save(repair_head.state_dict(), save_dir / "repair.pt")
                     elif method == "ours_v2":
-                        repair_head = RepairHeadV2(in_ch=6).to(device)
+                        # Paper-aligned repair input: [img, z, p, u, v, r] => 3 + 5 = 8 channels.
+                        repair_head = RepairHeadV2(in_ch=8).to(device)
                         repair_head = train_repair(
                             base_model=model,
                             head_mode="edl",

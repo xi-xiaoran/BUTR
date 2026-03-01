@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
-from methods.losses import edl_uncertainty_from_evidence
+from methods.losses import edl_uncertainty_from_evidence, edl_prob_uncert_logit_from_evidence
 
 
 # ---------------------- small utils ----------------------
@@ -64,7 +64,7 @@ class RepairHeadV1(nn.Module):
     Output: delta_logit [B,1,H,W]
     """
 
-    def __init__(self, in_ch=6, hidden=32):
+    def __init__(self, in_ch=8, hidden=32):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, hidden, 3, padding=1),
@@ -91,7 +91,7 @@ class RepairHeadV2(nn.Module):
       - out[:,1:2] = gate_logit  (sigmoid -> (0,1))
     """
 
-    def __init__(self, in_ch=6, hidden=64):
+    def __init__(self, in_ch=8, hidden=64):
         super().__init__()
 
         self.net = nn.Sequential(
@@ -120,12 +120,13 @@ class RepairHeadV2(nn.Module):
 def _base_forward(base_model, head_mode: str, img: torch.Tensor):
     out = base_model(img)
     if head_mode == "standard":
-        prob = torch.sigmoid(out)
+        logit = out
+        prob = torch.sigmoid(logit)
         unc = torch.zeros_like(prob)
     else:
         # EDL evidence head
-        prob, unc = edl_uncertainty_from_evidence(out)
-    return prob, unc
+        prob, unc, logit = edl_prob_uncert_logit_from_evidence(out)
+    return prob, unc, logit
 # ---------------------- optional certificate ----------------------
 def _make_roi(base_prob: torch.Tensor,
               uncert: torch.Tensor,
@@ -266,14 +267,22 @@ def run_ours_repair(base_model, head_mode: str, repair_head, img,
 
     out = base_model(img)
     if head_mode == "standard":
-        base_prob = torch.sigmoid(out)
+        base_logit = out
+        base_prob = torch.sigmoid(base_logit)
         uncert = torch.zeros_like(base_prob)
     else:
-        base_prob, uncert = edl_uncertainty_from_evidence(out)
+        # EDL: probability is evidential mean, uncertainty is vacuity, and
+        # base_logit is logit(p_fg) = log(alpha_fg) - log(alpha_bg).
+        base_prob, uncert, base_logit = edl_prob_uncert_logit_from_evidence(out)
 
-    # --- keep FG channel only (some backbones output 2ch logits/probs) ---
+    # --- keep FG channel only (robustness to any multi-channel outputs) ---
     if base_prob.dim() == 4 and base_prob.shape[1] > 1:
         base_prob = base_prob[:, -1:, ...]
+    if base_logit is None:
+        # should not happen, but keep safe defaults
+        base_logit = _safe_logit(base_prob)
+    if base_logit.dim() == 4 and base_logit.shape[1] > 1:
+        base_logit = base_logit[:, -1:, ...]
     if uncert is None:
         uncert = torch.zeros_like(base_prob)
     if uncert.dim() == 4 and uncert.shape[1] > 1:
@@ -297,6 +306,7 @@ def run_ours_repair(base_model, head_mode: str, repair_head, img,
 
     base_prob = _resize_to_img(base_prob, "bilinear")
     uncert = _resize_to_img(uncert, "bilinear")
+    base_logit = _resize_to_img(base_logit, "bilinear")
 
     # --- optional overrides ---
     if uncert_override is not None:
@@ -349,27 +359,27 @@ def run_ours_repair(base_model, head_mode: str, repair_head, img,
 
     roi = (roi > 0.5).float()
 
-    # --- iterative repair ---
-    eps = 1e-4
+    # --- iterative repair (paper-aligned): update logits z within ROI ---
+    # Inputs follow the paper: Concat[x, z, p, u, v, r]
     cur = base_prob
+    z_cur = base_logit
     for _ in range(int(iters)):
-        x = torch.cat([img, cur, uncert_used, viol_used], 1)
-        out = repair_head(x)
+        x_in = torch.cat([img, z_cur, cur, uncert_used, viol_used, roi], 1)
+        out = repair_head(x_in)
         if out.shape[1] == 1:
             delta = out
             gate = torch.ones_like(delta)
         else:
             delta = out[:, :1, ...]
             gate = torch.sigmoid(out[:, 1:2, ...])
-        p = cur.clamp(eps, 1 - eps)
-        base_logit = torch.log(p / (1 - p))
-        ref_logit = base_logit + (delta * gate) * roi
-        cur = torch.sigmoid(ref_logit)
+        z_cur = z_cur + (delta * gate) * roi
+        cur = torch.sigmoid(z_cur)
 
     return cur, uncert, {
         "roi": roi,
         "roi_mode": roi_mode,
         "viol_map": viol_used,
         "base_prob": base_prob.detach(),
+        "base_logit": base_logit.detach(),
         "topo": topo,
     }

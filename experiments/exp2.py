@@ -111,7 +111,8 @@ def main():
 
             # build models (edl head for ours)
             model = build_backbone(args.backbone, head_mode="edl").to(device)
-            repair = RepairHeadV2(in_ch=6).to(device)
+            # Paper-aligned repair input: [img, z, p, u, v, r] => 3 + 5 = 8 channels.
+            repair = RepairHeadV2(in_ch=8).to(device)
 
             model.load_state_dict(torch.load(ckpt_dir / "model.pt", map_location=device))
             repair.load_state_dict(torch.load(ckpt_dir / "repair.pt", map_location=device))
